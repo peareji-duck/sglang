@@ -158,6 +158,71 @@ def test_joint_threshold_penalty_matches_dense_logits():
     assert torch.equal(merged.argmax_ids, dense_argmax_ids)
 
 
+@pytest.mark.parametrize(
+    ("seed", "rows", "vocab_size", "shard_sizes"),
+    [
+        (0, 1, 7, [2, 3, 2]),
+        (1, 8, 31, [5, 9, 1, 16]),
+        (20260622, 13, 67, [17, 3, 19, 28]),
+    ],
+)
+def test_random_low_confidence_tp_state_matches_dense_with_padding_and_penalty(
+    seed: int,
+    rows: int,
+    vocab_size: int,
+    shard_sizes: list[int],
+):
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    logits = torch.randn(rows, vocab_size, generator=generator, dtype=torch.float32)
+    penalty_token_ids = torch.randint(
+        low=0,
+        high=vocab_size + 1,
+        size=(rows,),
+        generator=generator,
+        dtype=torch.long,
+    ) - 1
+    penalty_lambda = 0.625
+
+    penalized = logits.clone()
+    row_ids = torch.arange(rows)
+    penalized_rows = penalty_token_ids >= 0
+    penalized[row_ids[penalized_rows], penalty_token_ids[penalized_rows]] -= (
+        penalty_lambda
+    )
+    dense_argmax_ids, dense_max_probs = _dense_argmax_and_max_prob(penalized)
+
+    states = []
+    vocab_start = 0
+    for shard_size in shard_sizes:
+        shard_logits = logits[:, vocab_start : vocab_start + shard_size]
+        padded_logits = torch.cat(
+            [
+                shard_logits,
+                torch.full((rows, 3), 10000.0, dtype=torch.float32),
+            ],
+            dim=-1,
+        )
+        states.append(
+            local_vocab_state_from_logits(
+                local_logits=padded_logits,
+                vocab_start=vocab_start,
+                valid_vocab_size=shard_size,
+                penalized_token_ids=penalty_token_ids,
+                penalty_lambda=penalty_lambda,
+            )
+        )
+        vocab_start += shard_size
+
+    merged = merge_vocab_states(states)
+
+    torch.testing.assert_close(merged.max_probs, dense_max_probs)
+    torch.testing.assert_close(
+        merged.logsumexp,
+        torch.logsumexp(penalized.float(), dim=-1),
+    )
+    assert torch.equal(merged.argmax_ids, dense_argmax_ids)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_triton_local_vocab_state_matches_reference_cuda():
     from sglang.srt.dllm.tp_local_vocab_kernel import (
@@ -315,6 +380,41 @@ def test_float32_vocab_id_roundtrip_boundary_documents_guard():
 
     assert torch.equal(exact_id.float().long(), exact_id)
     assert not torch.equal(inexact_id.float().long(), inexact_id)
+
+
+def test_packed_vocab_state_preserves_exact_ids_at_float32_boundary():
+    states = [
+        VocabState(
+            max_values=torch.tensor([1.0, 4.0, 6.0], dtype=torch.float32),
+            argmax_ids=torch.tensor(
+                [FLOAT32_EXACT_INT_LIMIT, 9, FLOAT32_EXACT_INT_LIMIT],
+                dtype=torch.long,
+            ),
+            logsumexp=torch.tensor([2.0, 5.0, 7.0], dtype=torch.float32),
+            max_probs=torch.empty(3, dtype=torch.float32),
+        ),
+        VocabState(
+            max_values=torch.tensor([1.0, 4.0, 5.0], dtype=torch.float32),
+            argmax_ids=torch.tensor(
+                [FLOAT32_EXACT_INT_LIMIT - 1, 7, 11],
+                dtype=torch.long,
+            ),
+            logsumexp=torch.tensor([3.0, 6.0, 6.0], dtype=torch.float32),
+            max_probs=torch.empty(3, dtype=torch.float32),
+        ),
+    ]
+
+    expected = merge_vocab_states(states)
+    gathered = torch.stack([pack_vocab_state_for_tp_gather(state) for state in states])
+    actual = merge_gathered_packed_vocab_state(gathered)
+
+    assert torch.equal(actual.argmax_ids, expected.argmax_ids)
+    assert actual.argmax_ids[0].item() == FLOAT32_EXACT_INT_LIMIT - 1
+    assert actual.argmax_ids[1].item() == 7
+    assert actual.argmax_ids[2].item() == FLOAT32_EXACT_INT_LIMIT
+    torch.testing.assert_close(actual.max_values, expected.max_values)
+    torch.testing.assert_close(actual.logsumexp, expected.logsumexp)
+    torch.testing.assert_close(actual.max_probs, expected.max_probs)
 
 
 def test_packed_vocab_state_merge_matches_legacy_merge_with_tie_break():
