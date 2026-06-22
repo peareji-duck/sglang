@@ -3,6 +3,9 @@ from dataclasses import dataclass
 import torch
 
 
+FLOAT32_EXACT_INT_LIMIT = 1 << 24
+
+
 @dataclass(frozen=True)
 class VocabState:
     max_values: torch.Tensor
@@ -40,6 +43,57 @@ def local_vocab_state_from_logits(
         argmax_ids=local_argmax_ids.long() + int(vocab_start),
         logsumexp=logsumexp,
         max_probs=torch.exp(max_values - logsumexp),
+    )
+
+
+def can_pack_vocab_ids_as_float32(max_vocab_id_inclusive: int) -> bool:
+    max_vocab_id_inclusive = int(max_vocab_id_inclusive)
+    return 0 <= max_vocab_id_inclusive <= FLOAT32_EXACT_INT_LIMIT
+
+
+def pack_vocab_state_for_tp_gather(state: VocabState) -> torch.Tensor:
+    if state.max_values.dtype != torch.float32:
+        raise ValueError("VocabState.max_values must be torch.float32")
+    if state.logsumexp.dtype != torch.float32:
+        raise ValueError("VocabState.logsumexp must be torch.float32")
+
+    return torch.stack(
+        [
+            state.max_values,
+            state.logsumexp,
+            state.argmax_ids.to(dtype=torch.float32),
+        ],
+        dim=-1,
+    ).contiguous()
+
+
+def merge_gathered_packed_vocab_state(gathered: torch.Tensor) -> VocabState:
+    if gathered.ndim != 3 or gathered.shape[-1] != 3:
+        raise ValueError("gathered packed vocab state must have shape [tp, rows, 3]")
+    if gathered.shape[0] == 0:
+        raise ValueError("merge_gathered_packed_vocab_state requires at least one rank")
+
+    max_values_by_rank = gathered[:, :, 0]
+    logsumexp_by_rank = gathered[:, :, 1]
+    argmax_ids_by_rank = gathered[:, :, 2].long()
+
+    best_values = max_values_by_rank[0]
+    best_ids = argmax_ids_by_rank[0]
+    for rank in range(1, max_values_by_rank.shape[0]):
+        rank_values = max_values_by_rank[rank]
+        rank_ids = argmax_ids_by_rank[rank]
+        use_rank = (rank_values > best_values) | (
+            (rank_values == best_values) & (rank_ids < best_ids)
+        )
+        best_values = torch.where(use_rank, rank_values, best_values)
+        best_ids = torch.where(use_rank, rank_ids, best_ids)
+
+    merged_logsumexp = torch.logsumexp(logsumexp_by_rank, dim=0)
+    return VocabState(
+        max_values=best_values,
+        argmax_ids=best_ids.long(),
+        logsumexp=merged_logsumexp,
+        max_probs=torch.exp(best_values - merged_logsumexp),
     )
 
 

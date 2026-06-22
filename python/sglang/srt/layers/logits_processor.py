@@ -28,8 +28,11 @@ from sglang.srt.distributed import (
 from sglang.srt.dllm.tp_local_vocab_kernel import local_vocab_state_from_logits_triton
 from sglang.srt.dllm.tp_local_vocab_state import (
     VocabState,
+    can_pack_vocab_ids_as_float32,
     local_vocab_state_from_logits,
+    merge_gathered_packed_vocab_state,
     merge_vocab_states,
+    pack_vocab_state_for_tp_gather,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -76,6 +79,76 @@ _is_cpu = is_cpu()
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
 _in_autotune_dummy_run = False
+
+
+def _should_pack_dllm_vocab_state_for_gather(max_vocab_id_inclusive: int) -> bool:
+    return envs.SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER.get() and (
+        can_pack_vocab_ids_as_float32(int(max_vocab_id_inclusive))
+    )
+
+
+def _global_max_vocab_id_for_dllm_tp_state(
+    lm_head: VocabParallelEmbedding,
+    fallback_vocab_size: int,
+) -> int:
+    vocab_size = getattr(lm_head, "org_vocab_size", fallback_vocab_size)
+    return int(vocab_size) - 1
+
+
+def _merge_dllm_vocab_state_across_tp(
+    *,
+    local_state: VocabState,
+    tp_group,
+    tp_size: int,
+    global_max_vocab_id_inclusive: int,
+) -> VocabState:
+    num_rows = local_state.max_values.shape[0]
+
+    if _should_pack_dllm_vocab_state_for_gather(global_max_vocab_id_inclusive):
+        local_packed = pack_vocab_state_for_tp_gather(local_state)
+        gathered_packed = torch.empty(
+            (tp_size * num_rows, 3),
+            device=local_packed.device,
+            dtype=local_packed.dtype,
+        )
+        tp_group.all_gather_into_tensor(gathered_packed, local_packed)
+        return merge_gathered_packed_vocab_state(
+            gathered_packed.view(tp_size, num_rows, 3)
+        )
+
+    gathered_max = torch.empty(
+        (tp_size * num_rows,),
+        device=local_state.max_values.device,
+        dtype=local_state.max_values.dtype,
+    )
+    gathered_arg = torch.empty(
+        (tp_size * num_rows,),
+        device=local_state.argmax_ids.device,
+        dtype=local_state.argmax_ids.dtype,
+    )
+    gathered_lse = torch.empty(
+        (tp_size * num_rows,),
+        device=local_state.logsumexp.device,
+        dtype=local_state.logsumexp.dtype,
+    )
+    tp_group.all_gather_into_tensor(gathered_max, local_state.max_values.contiguous())
+    tp_group.all_gather_into_tensor(gathered_arg, local_state.argmax_ids.contiguous())
+    tp_group.all_gather_into_tensor(gathered_lse, local_state.logsumexp.contiguous())
+
+    gathered_max = gathered_max.view(tp_size, num_rows)
+    gathered_arg = gathered_arg.view(tp_size, num_rows)
+    gathered_lse = gathered_lse.view(tp_size, num_rows)
+    return merge_vocab_states(
+        [
+            VocabState(
+                max_values=gathered_max[rank],
+                argmax_ids=gathered_arg[rank],
+                logsumexp=gathered_lse[rank],
+                max_probs=torch.exp(gathered_max[rank] - gathered_lse[rank]),
+            )
+            for rank in range(tp_size)
+        ]
+    )
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -1084,40 +1157,14 @@ class LogitsProcessor(nn.Module):
         if tp_size == 1:
             return local_state
 
-        num_rows = local_state.max_values.shape[0]
-        gathered_max = torch.empty(
-            (tp_size * num_rows,),
-            device=local_state.max_values.device,
-            dtype=local_state.max_values.dtype,
-        )
-        gathered_arg = torch.empty(
-            (tp_size * num_rows,),
-            device=local_state.argmax_ids.device,
-            dtype=local_state.argmax_ids.dtype,
-        )
-        gathered_lse = torch.empty(
-            (tp_size * num_rows,),
-            device=local_state.logsumexp.device,
-            dtype=local_state.logsumexp.dtype,
-        )
-        tp_group = get_tp_group()
-        tp_group.all_gather_into_tensor(gathered_max, local_state.max_values.contiguous())
-        tp_group.all_gather_into_tensor(gathered_arg, local_state.argmax_ids.contiguous())
-        tp_group.all_gather_into_tensor(gathered_lse, local_state.logsumexp.contiguous())
-
-        gathered_max = gathered_max.view(tp_size, num_rows)
-        gathered_arg = gathered_arg.view(tp_size, num_rows)
-        gathered_lse = gathered_lse.view(tp_size, num_rows)
-        return merge_vocab_states(
-            [
-                VocabState(
-                    max_values=gathered_max[rank],
-                    argmax_ids=gathered_arg[rank],
-                    logsumexp=gathered_lse[rank],
-                    max_probs=torch.exp(gathered_max[rank] - gathered_lse[rank]),
-                )
-                for rank in range(tp_size)
-            ]
+        return _merge_dllm_vocab_state_across_tp(
+            local_state=local_state,
+            tp_group=get_tp_group(),
+            tp_size=tp_size,
+            global_max_vocab_id_inclusive=_global_max_vocab_id_for_dllm_tp_state(
+                lm_head,
+                self.vocab_size,
+            ),
         )
 
     def compute_logprobs_for_multi_item_scoring(

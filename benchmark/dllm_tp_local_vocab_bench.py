@@ -253,6 +253,49 @@ def parse_endpoints(args: argparse.Namespace) -> list[Endpoint]:
     ]
 
 
+def choose_equivalence_endpoints(endpoints: list[Endpoint]) -> tuple[Endpoint, Endpoint]:
+    baseline_names = {"baseline", "baseline_full_logits"}
+    baseline = next(
+        (endpoint for endpoint in endpoints if endpoint.name in baseline_names),
+        None,
+    )
+    if baseline is None:
+        raise ValueError(
+            "--check-equivalence requires an endpoint named baseline or baseline_full_logits"
+        )
+
+    for preferred_name in (
+        "tp_local_packed",
+        "tp_local",
+        "tp_local_vocab_state",
+        "tp_local_legacy",
+    ):
+        optimized = next(
+            (
+                endpoint
+                for endpoint in endpoints
+                if endpoint.name == preferred_name and endpoint is not baseline
+            ),
+            None,
+        )
+        if optimized is not None:
+            return baseline, optimized
+
+    optimized = next(
+        (
+            endpoint
+            for endpoint in endpoints
+            if endpoint is not baseline and endpoint.name not in baseline_names
+        ),
+        None,
+    )
+    if optimized is None:
+        raise ValueError(
+            "--check-equivalence requires a non-baseline optimized endpoint"
+        )
+    return baseline, optimized
+
+
 def parse_variant_metadata(items: Optional[list[str]]) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     for item in items or []:
@@ -839,10 +882,9 @@ async def main() -> None:
     output_path = Path(args.output)
 
     if args.check_equivalence:
-        if len(endpoints) < 2:
-            raise ValueError("--check-equivalence requires at least two endpoints")
+        baseline, optimized = choose_equivalence_endpoints(endpoints)
         equivalence = await check_equivalence(
-            endpoints[0], endpoints[1], args.prompt, args.max_new_tokens, args.timeout_s
+            baseline, optimized, args.prompt, args.max_new_tokens, args.timeout_s
         )
         print(json.dumps({"equivalence": equivalence}, sort_keys=True), flush=True)
 

@@ -5,10 +5,14 @@ import pytest
 import torch
 
 from sglang.srt.dllm.tp_local_vocab_state import (
+    FLOAT32_EXACT_INT_LIMIT,
     argmax_max_prob_from_logits_output,
+    can_pack_vocab_ids_as_float32,
     local_vocab_state_from_logits,
     low_confidence_transfer_mask,
+    merge_gathered_packed_vocab_state,
     merge_vocab_states,
+    pack_vocab_state_for_tp_gather,
     VocabState,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -295,6 +299,181 @@ def test_merge_vocab_states_tie_breaks_equal_max_values_by_token_id():
         merged.max_probs,
         torch.exp(merged.max_values - merged.logsumexp),
     )
+
+
+def test_can_pack_vocab_ids_as_float32_boundary():
+    assert can_pack_vocab_ids_as_float32(0) is True
+    assert can_pack_vocab_ids_as_float32(FLOAT32_EXACT_INT_LIMIT - 1) is True
+    assert can_pack_vocab_ids_as_float32(FLOAT32_EXACT_INT_LIMIT) is True
+    assert can_pack_vocab_ids_as_float32(-1) is False
+    assert can_pack_vocab_ids_as_float32(FLOAT32_EXACT_INT_LIMIT + 1) is False
+
+
+def test_float32_vocab_id_roundtrip_boundary_documents_guard():
+    exact_id = torch.tensor([FLOAT32_EXACT_INT_LIMIT])
+    inexact_id = torch.tensor([FLOAT32_EXACT_INT_LIMIT + 1])
+
+    assert torch.equal(exact_id.float().long(), exact_id)
+    assert not torch.equal(inexact_id.float().long(), inexact_id)
+
+
+def test_packed_vocab_state_merge_matches_legacy_merge_with_tie_break():
+    states = [
+        VocabState(
+            max_values=torch.tensor([5.0, 7.0, -1.0], dtype=torch.float32),
+            argmax_ids=torch.tensor([10, 12, 30]),
+            logsumexp=torch.tensor([5.1, 7.5, 2.0], dtype=torch.float32),
+            max_probs=torch.empty(3),
+        ),
+        VocabState(
+            max_values=torch.tensor([5.0, 6.0, 0.0], dtype=torch.float32),
+            argmax_ids=torch.tensor([8, 9, 25]),
+            logsumexp=torch.tensor([5.2, 6.5, 2.5], dtype=torch.float32),
+            max_probs=torch.empty(3),
+        ),
+        VocabState(
+            max_values=torch.tensor([4.0, 7.0, 1.0], dtype=torch.float32),
+            argmax_ids=torch.tensor([6, 11, 40]),
+            logsumexp=torch.tensor([5.3, 7.7, 3.0], dtype=torch.float32),
+            max_probs=torch.empty(3),
+        ),
+    ]
+
+    expected = merge_vocab_states(states)
+    gathered = torch.stack([pack_vocab_state_for_tp_gather(state) for state in states])
+
+    actual = merge_gathered_packed_vocab_state(gathered)
+
+    assert torch.equal(actual.max_values, expected.max_values)
+    assert torch.equal(actual.logsumexp, expected.logsumexp)
+    assert torch.equal(actual.argmax_ids, expected.argmax_ids)
+    assert actual.argmax_ids[0].item() == 8
+    assert actual.argmax_ids[1].item() == 11
+    torch.testing.assert_close(actual.max_probs, expected.max_probs)
+
+
+def test_pack_vocab_state_requires_float32_state_values():
+    base = VocabState(
+        max_values=torch.tensor([1.0], dtype=torch.float32),
+        argmax_ids=torch.tensor([5]),
+        logsumexp=torch.tensor([1.5], dtype=torch.float32),
+        max_probs=torch.tensor([0.6], dtype=torch.float32),
+    )
+
+    with pytest.raises(ValueError, match="max_values"):
+        pack_vocab_state_for_tp_gather(
+            VocabState(
+                max_values=base.max_values.double(),
+                argmax_ids=base.argmax_ids,
+                logsumexp=base.logsumexp,
+                max_probs=base.max_probs,
+            )
+        )
+
+    with pytest.raises(ValueError, match="logsumexp"):
+        pack_vocab_state_for_tp_gather(
+            VocabState(
+                max_values=base.max_values,
+                argmax_ids=base.argmax_ids,
+                logsumexp=base.logsumexp.double(),
+                max_probs=base.max_probs,
+            )
+        )
+
+
+def test_packed_gather_gate_uses_vocab_upper_bound_and_env():
+    import sglang.srt.layers.logits_processor as logits_processor
+    from sglang.srt.environ import envs
+
+    assert can_pack_vocab_ids_as_float32(151669)
+    assert not can_pack_vocab_ids_as_float32(FLOAT32_EXACT_INT_LIMIT + 1)
+
+    with envs.SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER.override(True):
+        assert logits_processor._should_pack_dllm_vocab_state_for_gather(151669)
+        assert not logits_processor._should_pack_dllm_vocab_state_for_gather(
+            FLOAT32_EXACT_INT_LIMIT + 1
+        )
+
+    with envs.SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER.override(False):
+        assert not logits_processor._should_pack_dllm_vocab_state_for_gather(151669)
+
+
+def test_dllm_vocab_state_tp_merge_uses_rank_uniform_packed_or_legacy_path():
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.logits_processor import _merge_dllm_vocab_state_across_tp
+
+    states = [
+        VocabState(
+            max_values=torch.tensor([2.0, 5.0], dtype=torch.float32),
+            argmax_ids=torch.tensor([12, 40], dtype=torch.long),
+            logsumexp=torch.tensor([3.0, 6.0], dtype=torch.float32),
+            max_probs=torch.empty(2),
+        ),
+        VocabState(
+            max_values=torch.tensor([2.0, 4.0], dtype=torch.float32),
+            argmax_ids=torch.tensor([9, 30], dtype=torch.long),
+            logsumexp=torch.tensor([4.0, 7.0], dtype=torch.float32),
+            max_probs=torch.empty(2),
+        ),
+        VocabState(
+            max_values=torch.tensor([1.0, 6.0], dtype=torch.float32),
+            argmax_ids=torch.tensor([7, 35], dtype=torch.long),
+            logsumexp=torch.tensor([5.0, 8.0], dtype=torch.float32),
+            max_probs=torch.empty(2),
+        ),
+    ]
+
+    class FakeTPGroup:
+        def __init__(self, all_states):
+            self.all_states = all_states
+            self.calls = []
+            self.float_call_index = 0
+
+        def all_gather_into_tensor(self, output, input_tensor):
+            self.calls.append(
+                (tuple(output.shape), tuple(input_tensor.shape), input_tensor.dtype)
+            )
+            if input_tensor.dim() == 2:
+                packed_states = [
+                    pack_vocab_state_for_tp_gather(state)
+                    for state in self.all_states
+                ]
+                output.copy_(torch.cat(packed_states, dim=0))
+                return
+            if input_tensor.dtype == torch.long:
+                output.copy_(torch.cat([state.argmax_ids for state in self.all_states]))
+                return
+
+            values = [state.max_values for state in self.all_states]
+            if self.float_call_index == 1:
+                values = [state.logsumexp for state in self.all_states]
+            output.copy_(torch.cat(values))
+            self.float_call_index += 1
+
+    with envs.SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER.override(True):
+        packed_group = FakeTPGroup(states)
+        packed = _merge_dllm_vocab_state_across_tp(
+            local_state=states[0],
+            tp_group=packed_group,
+            tp_size=len(states),
+            global_max_vocab_id_inclusive=151669,
+        )
+        assert len(packed_group.calls) == 1
+        assert packed_group.calls[0][0] == (len(states) * 2, 3)
+
+        legacy_group = FakeTPGroup(states)
+        legacy = _merge_dllm_vocab_state_across_tp(
+            local_state=states[0],
+            tp_group=legacy_group,
+            tp_size=len(states),
+            global_max_vocab_id_inclusive=FLOAT32_EXACT_INT_LIMIT + 1,
+        )
+        assert len(legacy_group.calls) == 3
+
+    torch.testing.assert_close(packed.max_probs, legacy.max_probs)
+    assert torch.equal(packed.max_values, legacy.max_values)
+    assert torch.equal(packed.logsumexp, legacy.logsumexp)
+    assert torch.equal(packed.argmax_ids, legacy.argmax_ids)
 
 
 def test_logits_processor_tp_local_vocab_gate(monkeypatch):

@@ -67,3 +67,26 @@ and TP full-logits traffic to matter:
 - SDAR-30B-A3B: about 1.08x at concurrency 16, about 1.08x at concurrency 32.
 
 This benchmark is a serving smoke benchmark, not a full quality evaluation.
+
+## Packed TP-State Gather Follow-up
+
+The packed-gather follow-up compares the previous compact-state three-gather
+merge against the exact one-gather packed merge. Both runs used TP=4, 128
+measured requests, 32 warmup requests, 3 repeats, and concurrency 16/32.
+
+Artifacts:
+
+- SDAR-8B: `/kelp/vocab/sglang-lab/bench/sdar8b-packed-gather-20260622193555/paper_outputs/8b`
+- SDAR-30B-A3B: `/kelp/vocab/sglang-lab/bench/sdar30b-packed-gather-20260622194454/paper_outputs/30b`
+
+| model | concurrency | legacy tok/s | packed tok/s | packed vs legacy |
+| --- | ---: | ---: | ---: | ---: |
+| SDAR-8B | 16 | 1479.9 | 1512.0 | 1.022x |
+| SDAR-8B | 32 | 1715.8 | 1809.2 | 1.054x |
+| SDAR-30B-A3B | 16 | 1249.0 | 1261.1 | 1.010x |
+| SDAR-30B-A3B | 32 | 1763.2 | 1761.7 | 0.999x |
+
+Decision: keep packed gather enabled by default. It preserves deterministic
+equivalence in smoke checks, reduces TP collective count from three gathers to
+one, and was neutral-to-positive in this run. Treat the throughput delta as a
+small PR-polish improvement, not the paper-level speedup source.
