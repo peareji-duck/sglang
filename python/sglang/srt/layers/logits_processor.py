@@ -23,6 +23,10 @@ from torch import nn
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.dllm.consumer_state_trace import (
+    emit_compact_vocab_state_trace,
+    emit_full_vocab_trace,
+)
 from sglang.srt.dllm.tp_local_vocab_kernel import (
     can_use_local_vocab_state_triton,
     local_vocab_state_from_logits_triton,
@@ -94,6 +98,13 @@ def _global_max_vocab_id_for_dllm_tp_state(
 ) -> int:
     vocab_size = getattr(lm_head, "org_vocab_size", fallback_vocab_size)
     return int(vocab_size) - 1
+
+
+def _tp_rank_for_trace() -> int:
+    try:
+        return int(getattr(get_tp_group(), "rank_in_group", 0))
+    except Exception:
+        return 0
 
 
 def _merge_dllm_vocab_state_across_tp(
@@ -1090,6 +1101,14 @@ class LogitsProcessor(nn.Module):
                 ),
             )
         full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        emit_full_vocab_trace(
+            component="sglang.logits_processor._get_dllm_logits",
+            full_logits=full_logits,
+            vocab_size=self.vocab_size,
+            tp_size=int(get_parallel().tp_size),
+            rank=_tp_rank_for_trace(),
+            consumer_contract="dllm_full_logits",
+        )
         return LogitsProcessorOutput(
             full_logits=full_logits,
             next_token_logits=None,
@@ -1163,18 +1182,43 @@ class LogitsProcessor(nn.Module):
             )
 
         tp_size = int(get_parallel().tp_size)
+        global_max_vocab_id = _global_max_vocab_id_for_dllm_tp_state(
+            lm_head,
+            self.vocab_size,
+        )
+        packed_gather = _should_pack_dllm_vocab_state_for_gather(global_max_vocab_id)
         if tp_size == 1:
+            emit_compact_vocab_state_trace(
+                component="sglang.logits_processor._get_dllm_vocab_state",
+                local_logits=local_logits,
+                state=local_state,
+                vocab_size=global_max_vocab_id + 1,
+                valid_vocab_size=valid_vocab_size,
+                tp_size=tp_size,
+                rank=_tp_rank_for_trace(),
+                packed_gather=packed_gather,
+                consumer_contract="dllm_low_confidence",
+            )
             return local_state
 
-        return _merge_dllm_vocab_state_across_tp(
+        merged_state = _merge_dllm_vocab_state_across_tp(
             local_state=local_state,
             tp_group=get_tp_group(),
             tp_size=tp_size,
-            global_max_vocab_id_inclusive=_global_max_vocab_id_for_dllm_tp_state(
-                lm_head,
-                self.vocab_size,
-            ),
+            global_max_vocab_id_inclusive=global_max_vocab_id,
         )
+        emit_compact_vocab_state_trace(
+            component="sglang.logits_processor._get_dllm_vocab_state",
+            local_logits=local_logits,
+            state=merged_state,
+            vocab_size=global_max_vocab_id + 1,
+            valid_vocab_size=valid_vocab_size,
+            tp_size=tp_size,
+            rank=_tp_rank_for_trace(),
+            packed_gather=packed_gather,
+            consumer_contract="dllm_low_confidence",
+        )
+        return merged_state
 
     def compute_logprobs_for_multi_item_scoring(
         self,
