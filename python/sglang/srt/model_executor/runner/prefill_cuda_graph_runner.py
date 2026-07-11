@@ -44,6 +44,7 @@ import torch
 import tqdm
 
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -146,6 +147,55 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _slice_dllm_vocab_state(vocab_state, num_tokens: int):
+    if vocab_state is None:
+        return None
+    return vocab_state.__class__(
+        max_values=vocab_state.max_values[:num_tokens],
+        argmax_ids=vocab_state.argmax_ids[:num_tokens],
+        logsumexp=vocab_state.logsumexp[:num_tokens],
+        max_probs=vocab_state.max_probs[:num_tokens],
+    )
+
+
+def _slice_optional_tensor(value: Optional[torch.Tensor], num_tokens: int):
+    return value[:num_tokens] if value is not None else None
+
+
+def _slice_prefill_logits_output(
+    output: LogitsProcessorOutput,
+    num_tokens: int,
+    *,
+    logits_rows: Optional[int] = None,
+    is_dllm: bool,
+    is_speculative: bool,
+) -> LogitsProcessorOutput:
+    if logits_rows is None:
+        logits_rows = num_tokens
+    mm_input_embeds = None
+    if is_speculative and output.mm_input_embeds is not None:
+        mm_input_embeds = output.mm_input_embeds[:num_tokens]
+
+    return LogitsProcessorOutput(
+        next_token_logits=(
+            None
+            if is_dllm
+            else _slice_optional_tensor(output.next_token_logits, logits_rows)
+        ),
+        hidden_states=_slice_optional_tensor(output.hidden_states, num_tokens),
+        full_logits=(
+            _slice_optional_tensor(output.full_logits, num_tokens) if is_dllm else None
+        ),
+        dllm_vocab_state=(
+            _slice_dllm_vocab_state(output.dllm_vocab_state, num_tokens)
+            if is_dllm
+            else None
+        ),
+        customized_info=output.customized_info,
+        mm_input_embeds=mm_input_embeds,
+    )
+
+
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
@@ -204,6 +254,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm = self.dllm_config is not None
 
         # --- buffers ---------------------------------------------------
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
@@ -1087,24 +1139,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     )
 
             if isinstance(output, LogitsProcessorOutput):
-                # Preserve mm_input_embeds for speculative decoding.
-                mm_input_embeds = None
-                if (
-                    self.model_runner.spec_algorithm.is_speculative()
-                    and output.mm_input_embeds is not None
-                ):
-                    mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
                 logits_rows = (
                     self.raw_bs if self._is_full_backend else self.raw_num_tokens
                 )
-                return LogitsProcessorOutput(
-                    next_token_logits=output.next_token_logits[:logits_rows],
-                    hidden_states=(
-                        output.hidden_states[: self.raw_num_tokens]
-                        if output.hidden_states is not None
-                        else None
-                    ),
-                    mm_input_embeds=mm_input_embeds,
+                return _slice_prefill_logits_output(
+                    output,
+                    self.raw_num_tokens,
+                    logits_rows=logits_rows,
+                    is_dllm=self.is_dllm,
+                    is_speculative=self.model_runner.spec_algorithm.is_speculative(),
                 )
             elif isinstance(output, EmbeddingPoolerOutput):
                 return output

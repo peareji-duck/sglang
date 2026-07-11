@@ -44,7 +44,7 @@ class DllmAlgorithm:
     def step(
         self,
         forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
         states: List[Any],
     ) -> List[bool]:
         """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
@@ -82,7 +82,7 @@ class DllmAlgorithm:
 
         states = self.init_step_state(forward_batch)
         for _ in range(self.max_steps(self.block_size)):
-            done = self.step(forward_batch, out.logits_output.full_logits, states)
+            done = self.step(forward_batch, out.logits_output, states)
             if all(done):
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
@@ -114,7 +114,7 @@ class DllmAlgorithm:
                 states.append(carried)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        done = self.step(forward_batch, out.logits_output.full_logits, states)
+        done = self.step(forward_batch, out.logits_output, states)
 
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
         next_token_ids_list = forward_batch.input_ids.view(
