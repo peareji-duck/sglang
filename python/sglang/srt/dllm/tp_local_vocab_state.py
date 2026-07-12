@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 import torch
 
-
 FLOAT32_EXACT_INT_LIMIT = 1 << 24
 
 

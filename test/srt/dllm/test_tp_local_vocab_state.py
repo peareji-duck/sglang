@@ -39,13 +39,13 @@ _stub_unavailable_sgl_kernel()
 
 from sglang.srt.dllm.tp_local_vocab_state import (  # noqa: E402
     FLOAT32_EXACT_INT_LIMIT,
+    VocabState,
     argmax_max_prob_from_logits_output,
     can_pack_vocab_ids_as_float32,
     local_vocab_state_from_logits,
     merge_gathered_packed_vocab_state,
     merge_vocab_states,
     pack_vocab_state_for_tp_gather,
-    VocabState,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput  # noqa: E402
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: E402
@@ -507,11 +507,11 @@ def test_pack_vocab_state_requires_float32_state_values():
 
 def test_packed_gather_gate_uses_vocab_upper_bound_and_env():
     import sglang.srt.layers.logits_processor as logits_processor
-    from sglang.srt.environ import envs
     from sglang.srt.dllm.tp_local_vocab_kernel import (
         LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB,
         can_use_local_vocab_state_triton,
     )
+    from sglang.srt.environ import envs
 
     assert can_pack_vocab_ids_as_float32(151669)
     assert not can_pack_vocab_ids_as_float32(FLOAT32_EXACT_INT_LIMIT + 1)

@@ -45,9 +45,7 @@ class LowConfidence(DllmAlgorithm):
             logits = full_logits.view(batch_size, self.block_size, vocab_size)
             x = torch.argmax(logits, dim=-1)
             probs = torch.nn.functional.softmax(logits, dim=-1)
-            confidence = torch.gather(
-                probs, dim=-1, index=x.unsqueeze(-1)
-            ).squeeze(-1)
+            confidence = torch.gather(probs, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)
         confidence = torch.where(block_mask_index, confidence, -float("inf"))
 
         transfer_index = confidence > self.threshold

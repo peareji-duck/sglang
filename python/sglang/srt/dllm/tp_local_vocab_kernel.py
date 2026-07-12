@@ -4,7 +4,6 @@ import triton.language as tl
 
 from sglang.srt.dllm.tp_local_vocab_state import VocabState
 
-
 LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB = 131072
 
 
